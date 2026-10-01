@@ -1,0 +1,9 @@
+url,label
+https://google.com,0
+http://login-verify-secure-account.com/update,1
+https://github.com/scikit-learn/scikit-learn,0
+http://192.168.1.1/admin/login.php,1
+https://paypal.com.account-update.secure.xyz@bad.com/login,1
+https://wikipedia.org/wiki/Main_Page,0
+http://bit.ly/3xYz89,1
+http://malicious-phishing-link-123.net/confirm,1

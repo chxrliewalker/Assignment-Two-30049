@@ -1,0 +1,4 @@
+url_len,domain_len,path_len,count_dots,count_hyphens,count_slashes,count_questions,count_equal,count_at,count_digits,domain_count_dots,has_http,has_https,is_ip_address,domain_has_prefix_suffix_hyphen,is_shortened,count_suspicious_keywords,domain_entropy,label
+58,44,6,5,1,3,0,0,1,0,5,0,1,0,0,0,5,4.053784540638109,1
+36,13,15,1,0,4,0,0,0,0,1,0,1,0,0,0,0,3.334679141051595,0
+46,31,8,1,3,3,0,0,0,3,1,1,0,0,0,0,1,4.079376456233206,1
