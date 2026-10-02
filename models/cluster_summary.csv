@@ -1,0 +1,4 @@
+cluster,url_len,domain_len,path_len,count_dots,count_hyphens,count_slashes,count_questions,count_equal,count_at,count_digits,domain_count_dots,has_http,has_https,is_ip_address,domain_has_prefix_suffix_hyphen,is_shortened,count_suspicious_keywords,domain_entropy
+0,45.0,31.0,7.0,1.0,3.0,3.0,0.0,0.0,0.0,0.0,1.0,1.0,0.0,0.0,0.0,1.0,5.0,3.978
+1,34.0,11.0,16.0,4.0,0.0,4.0,0.0,0.0,0.0,8.0,3.0,1.0,0.0,1.0,0.0,0.0,1.0,2.3
+2,20.0,6.0,7.0,1.0,0.0,3.0,0.0,0.0,0.0,3.0,1.0,1.0,0.0,0.0,0.0,1.0,0.0,2.585
