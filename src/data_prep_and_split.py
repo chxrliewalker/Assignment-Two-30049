@@ -1,135 +1,155 @@
+"""
+data_prep_and_split.py
+----------------------
+Builds the processed datasets from two raw sources.
+
+Sources (datasets/raw/):
+    malicious_phish.csv      base dataset (Kaggle, Siddhartha 2021): url, type
+    alexa_top30k_2016.csv    additional dataset: the 30,000 most-visited
+                             websites, Alexa ranking 2016: rank, domain
+
+Why the additional source: in the base dataset only 277 benign URLs are a bare
+domain (e.g. "google.com"), against 21,677 phishing ones, so a model learns
+"no path = phishing" and flags google.com. Popular websites from the same year
+add the missing legitimate bare domains.
+
+Steps:
+    1. Load the base dataset; drop empty rows and malformed strings
+    2. Map the four text labels to a binary target
+           benign -> 0 ; phishing, defacement, malware -> 1
+       `type` is kept for checks (cluster composition, held-out tests) but is
+       never a model feature
+    3. Transform the additional source into the base format:
+           domain -> url, type = "benign", label = 0, source = "alexa"
+       ranks 1-20,000 join the dataset; ranks 20,001-30,000 are kept aside
+       as an unseen "popular sites" test set
+    4. Remove duplicates across both sources, exact and after
+       canonicalisation ("http://www.x.com" and "x.com" are the same URL);
+       a canonical URL labelled both benign and malicious is dropped
+    5. Extract features (feature_extraction.py)
+    6. Stratified 70/30 train/test split, random_state=42
+    7. Save train_features.csv, test_features.csv and popular_sites_holdout.csv
+
+Usage (from the project root):
+    python src/data_prep_and_split.py
+"""
+
 import os
-import sys #bububhyub
+import sys
+
 import pandas as pd
-import numpy as np
 from sklearn.model_selection import train_test_split
 
-# Dynamic project root calculation
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# If script is inside 'src', project root is parent directory; otherwise current directory
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR) if os.path.basename(SCRIPT_DIR) == 'src' else SCRIPT_DIR
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-if SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, SCRIPT_DIR)
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
+from feature_extraction import (FEATURE_COLUMNS, canonicalise,  # noqa: E402
+                                extract_url_features, safe_url_parse)
 
-try:
-    from feature_extraction import extract_url_features
-except ImportError:
-    try:
-        from src.feature_extraction import extract_url_features
-    except ImportError:
-        raise ImportError(
-            "Could not import 'feature_extraction'. Ensure 'feature_extraction.py' "
-            "is located in the same directory or in 'src/'."
-        )
+RAW_DIR = os.path.join(PROJECT_ROOT, "datasets", "raw")
+BASE_PATH = os.path.join(RAW_DIR, "malicious_phish.csv")
+ALEXA_PATH = os.path.join(RAW_DIR, "alexa_top30k_2016.csv")
+OUT_DIR = os.path.join(PROJECT_ROOT, "datasets", "processed")
 
-def load_and_preprocess_data(csv_path, url_column='url', label_column='label'):
-    """
-    Loads raw CSV dataset, cleans raw inputs, and validates target labels.
-    """
-    print(f"Loading dataset from: {csv_path}")
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Dataset file not found at: {csv_path}. Please check the file path.")
+LABEL_MAP = {"benign": 0, "phishing": 1, "defacement": 1, "malware": 1}
+ALEXA_TRAIN_RANKS = 20000      # ranks 1..20,000 are added to the dataset
+TEST_SIZE = 0.30
+RANDOM_STATE = 42
+OUT_COLUMNS = ["url", "type", "label", "source"] + FEATURE_COLUMNS
 
-    df = pd.read_csv(csv_path)
-    
-    cols_lower = {c.lower(): c for c in df.columns}
-    if url_column not in df.columns and 'raw_url' in cols_lower:
-        url_column = cols_lower['raw_url']
-    elif url_column not in df.columns and 'urls' in cols_lower:
-        url_column = cols_lower['urls']
 
-    if label_column not in df.columns and 'target' in cols_lower:
-        label_column = cols_lower['target']
-    elif label_column not in df.columns and 'class' in cols_lower:
-        label_column = cols_lower['class']
+def has_valid_host(url):
+    """A usable URL needs a host containing a dot (a domain or an IP address)
+    and no control characters. A few raw rows are corrupted binary text."""
+    host = safe_url_parse(canonicalise(url)).netloc
+    return "." in host and not any(ord(ch) < 32 or ord(ch) == 127 for ch in host)
 
-    df = df.dropna(subset=[url_column, label_column]).copy()
-    df[url_column] = df[url_column].astype(str).str.strip()
-    df[label_column] = df[label_column].astype(int)
-    
-    print(f"Loaded {len(df)} valid records.")
-    print(f"Class Distribution:\n{df[label_column].value_counts(normalize=True).round(4) * 100}%")
-    return df, url_column, label_column
 
-def prepare_and_split(df, url_column='url', label_column='label', test_size=0.3, random_state=42):
-    """
-    Extracts features and performs a stratified train/test split.
-    """
-    print("\n--- Phase 1: Feature Extraction ---")
-    features_df = extract_url_features(df, url_column=url_column)
-    
-    non_feature_cols = [url_column, label_column]
-    feature_cols = [c for c in features_df.columns if c not in non_feature_cols]
-    
-    X = features_df[feature_cols].copy()
-    y = features_df[label_column].copy()
-    
-    print(f"Extracted {X.shape[1]} numerical features across {X.shape[0]} samples.")
-    print(f"Feature List: {list(X.columns)}")
-    
-    print(f"\n--- Phase 2: Stratified Train/Test Split (Test Size: {int(test_size*100)}%) ---")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, stratify=y, random_state=random_state
-    )
-    
-    print(f"Training Set: {X_train.shape[0]} samples")
-    print(f"Testing Set:  {X_test.shape[0]} samples")
-    
-    return X_train, X_test, y_train, y_test, list(X.columns)
+def load_base(path=BASE_PATH):
+    """Load and clean the Kaggle base dataset."""
+    print(f"Base dataset: {path}")
+    df = pd.read_csv(path)
+    print(f"  raw rows:                          {len(df):,}")
+    df = df.dropna(subset=["url", "type"]).copy()
+    df["url"] = df["url"].astype(str).str.strip()
+    df["type"] = df["type"].astype(str).str.strip().str.lower()
+    df = df[df["url"] != ""]
+    valid = df["url"].map(has_valid_host)
+    print(f"  malformed (no valid host) removed: {int((~valid).sum()):,}")
+    df = df[valid]
 
-def save_split_data(X_train, X_test, y_train, y_test, output_dir):
-    """
-    Saves the train/test splits as CSV files inside datasets/processed/.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    
-    train_path = os.path.join(output_dir, 'train_features.csv')
-    test_path = os.path.join(output_dir, 'test_features.csv')
+    unknown = set(df["type"]) - set(LABEL_MAP)
+    if unknown:
+        raise ValueError(f"Unexpected label values: {unknown}")
+    df["label"] = df["type"].map(LABEL_MAP).astype(int)
+    df["source"] = "kaggle"
+    return df[["url", "type", "label", "source"]]
 
-    train_df = X_train.copy()
-    train_df['label'] = y_train
-    train_df.to_csv(train_path, index=False)
-    
-    test_df = X_test.copy()
-    test_df['label'] = y_test
-    test_df.to_csv(test_path, index=False)
-    
-    print(f"\nSaved processed split datasets to: {output_dir}")
-    print(f" - {train_path}")
-    print(f" - {test_path}")
+
+def load_alexa(path=ALEXA_PATH):
+    """Bring the Alexa list into the base dataset's shape.
+    Returns (rows added to the dataset, rows kept aside for testing)."""
+    alexa = pd.read_csv(path)
+    alexa = alexa.rename(columns={"domain": "url"})
+    alexa["url"] = alexa["url"].astype(str).str.strip().str.lower()
+    alexa["type"], alexa["label"], alexa["source"] = "benign", 0, "alexa"
+    cols = ["url", "type", "label", "source"]
+    add = alexa[alexa["rank"] <= ALEXA_TRAIN_RANKS][cols]
+    holdout = alexa[alexa["rank"] > ALEXA_TRAIN_RANKS][cols]
+    print(f"Additional dataset: {path}")
+    print(f"  added to dataset: {len(add):,}   kept aside for testing: {len(holdout):,}")
+    return add, holdout
+
+
+def deduplicate(df):
+    """Remove exact duplicates, then duplicates after canonicalisation.
+    A canonical URL that carries both labels is ambiguous: all copies go."""
+    before = len(df)
+    df = df.drop_duplicates(subset="url", keep="first")
+    print(f"  exact duplicates removed:          {before - len(df):,}")
+
+    df = df.assign(canonical=df["url"].map(canonicalise))
+    labels = df.groupby("canonical")["label"].nunique()
+    conflicting = labels[labels > 1].index
+    in_conflict = df["canonical"].isin(conflicting)
+    print(f"  rows with conflicting labels:      {int(in_conflict.sum()):,} "
+          f"({len(conflicting):,} URLs), all dropped")
+    df = df[~in_conflict]
+    before = len(df)
+    df = df.drop_duplicates(subset="canonical", keep="first")
+    print(f"  canonical duplicates removed:      {before - len(df):,}")
+    return df.drop(columns="canonical").reset_index(drop=True)
+
+
+def main():
+    base = load_base()
+    alexa_add, alexa_holdout = load_alexa()
+
+    print("Combining and de-duplicating:")
+    data = deduplicate(pd.concat([base, alexa_add], ignore_index=True))
+    print(f"  final rows:                        {len(data):,}")
+    print("\nRows per source and type:")
+    print(data.groupby(["source", "type"]).size().to_string())
+
+    # The held-out popular sites must not overlap the main dataset
+    seen = set(data["url"].map(canonicalise))
+    alexa_holdout = alexa_holdout[~alexa_holdout["url"].map(canonicalise).isin(seen)]
+
+    print(f"\nExtracting {len(FEATURE_COLUMNS)} features...")
+    full = extract_url_features(data)[OUT_COLUMNS]
+    holdout = extract_url_features(alexa_holdout)[OUT_COLUMNS]
+
+    train, test = train_test_split(full, test_size=TEST_SIZE,
+                                   stratify=full["label"], random_state=RANDOM_STATE)
+    print(f"Train: {len(train):,}   Test: {len(test):,}   Popular-sites holdout: {len(holdout):,}")
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for name, part in (("train_features.csv", train), ("test_features.csv", test),
+                       ("popular_sites_holdout.csv", holdout)):
+        part.to_csv(os.path.join(OUT_DIR, name), index=False)
+        print(f"Saved datasets/processed/{name}")
+
 
 if __name__ == "__main__":
-    datasets_dir = os.path.join(PROJECT_ROOT, 'datasets')
-    raw_dir = os.path.join(datasets_dir, 'raw')
-    processed_dir = os.path.join(datasets_dir, 'processed')
-    
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(processed_dir, exist_ok=True)
-
-    if len(sys.argv) > 1 and sys.argv[1].endswith('.csv'):
-        raw_csv_path = sys.argv[1]
-    else:
-        raw_csv_path = os.path.join(raw_dir, 'sample_phishing_data.csv')
-        sample_data = pd.DataFrame({
-            'url': [
-                'https://google.com',
-                'http://login-verify-secure-account.com/update',
-                'https://github.com/scikit-learn/scikit-learn',
-                'http://192.168.1.1/admin/login.php',
-                'https://paypal.com.account-update.secure.xyz@bad.com/login',
-                'https://wikipedia.org/wiki/Main_Page',
-                'http://bit.ly/3xYz89',
-                'http://malicious-phishing-link-123.net/confirm'
-            ],
-            'label': [0, 1, 0, 1, 1, 0, 1, 1]  # 0 = Legitimate, 1 = Phishing
-        })
-        sample_data.to_csv(raw_csv_path, index=False)
-    
-    print(f"Running Data Prep and Split Pipeline on: {raw_csv_path}\n")
-    df, url_col, label_col = load_and_preprocess_data(raw_csv_path)
-    X_train, X_test, y_train, y_test, feature_names = prepare_and_split(df, url_column=url_col, label_column=label_col)
-    
-    save_split_data(X_train, X_test, y_train, y_test, output_dir=processed_dir)
+    main()

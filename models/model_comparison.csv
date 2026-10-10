@@ -1,4 +1,6 @@
-Model,Accuracy,Precision,Recall,F1 Score
-LogisticRegression,1.0,1.0,1.0,1.0
-DecisionTree,0.6667,1.0,0.5,0.6667
-RandomForest,1.0,1.0,1.0,1.0
+Model,Beyond unit,Accuracy,Precision,Recall,F1,FPR,TN,FP,FN,TP,Train seconds,Size MB
+LogisticRegression,False,0.7501,0.8221,0.2777,0.4152,0.0282,129194,3748,45061,17325,2.0,0.0
+DecisionTree,False,0.77,0.9399,0.2989,0.4536,0.009,131749,1193,43736,18650,1.3,0.0
+RandomForest,False,0.8878,0.8702,0.7625,0.8128,0.0534,125846,7096,14814,47572,44.0,88.6
+GradientBoosting,True,0.8517,0.8419,0.6597,0.7397,0.0581,125213,7729,21233,41153,12.5,0.5
+CharNgram,True,0.9476,0.9332,0.9002,0.9164,0.0302,128924,4018,6225,56161,51.5,9.1

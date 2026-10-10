@@ -1,0 +1,11 @@
+Test,Model,Precision,Recall,F1,FPR on https benign,FPR
+Unseen domains,RandomForest,0.7035,0.5626,0.6252,,
+Unseen domains,CharNgram,0.8125,0.7415,0.7753,,
+Unseen type (phishing) - seen in training,RandomForest,,0.6074,,,
+Unseen type (phishing) - held out,RandomForest,,0.0425,,,
+Unseen type (phishing) - seen in training,CharNgram,,0.7774,,,
+Unseen type (phishing) - held out,CharNgram,,0.0201,,,
+Scheme ablation - with scheme flags,RandomForest,,,0.8896,0.8909,
+Scheme ablation - without (final),RandomForest,,,,0.0534,
+Unseen popular websites,RandomForest,,,,,0.2154
+Unseen popular websites,CharNgram,,,,,0.2373

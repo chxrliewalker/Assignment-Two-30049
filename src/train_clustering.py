@@ -1,151 +1,166 @@
+"""
+train_clustering.py
+-------------------
+Unsupervised k-means clustering WITHIN the malicious class only.
+
+The label and the original `type` column are NOT used to build the clusters.
+`type` is attached afterwards only to check that the clusters are real.
+
+Steps:
+    1. Keep malicious training URLs (label == 1), feature columns only
+    2. log1p on count/length features (they are heavily skewed, so a few
+       extreme URLs would otherwise dominate), then standardise
+    3. Choose k by silhouette score for k = 2..8 (on a 10,000-row sample):
+       the smallest k within 5% of the best score
+    4. Fit k-means with the chosen k
+    5. Describe each cluster:
+         - z-score of each feature's cluster mean vs. the overall malicious
+           mean (in standard deviations), and the 3 most different features
+         - label composition by original `type` (check only)
+         - example URLs closest to the cluster centre
+
+Outputs (in models/):
+    cluster_summary.csv      z-score profile, size, top features, composition
+    cluster_examples.csv     5 example URLs per cluster
+    plots/silhouette_k.png   silhouette score for each k
+    plots/kmeans_clusters.png  2-D PCA view of the clusters
+
+Usage (from the project root):
+    python src/train_clustering.py
+"""
+
 import os
 import sys
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 
-def get_project_root():
-    """
-    Determines project root directory whether script is run from root or src/.
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if os.path.basename(script_dir) in ['src', 'clustering', 'classifier']:
-        return os.path.abspath(os.path.join(script_dir, '..'))
-    return os.getcwd()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-def load_phishing_features(data_dir=None):
-    """
-    Loads train_features.csv and filters strictly for phishing instances (label == 1).
-    """
-    if data_dir is None:
-        project_root = get_project_root()
-        data_dir = os.path.join(project_root, 'datasets', 'processed')
+from feature_extraction import FEATURE_COLUMNS  # noqa: E402
 
-    train_path = os.path.join(data_dir, 'train_features.csv')
-    
-    if not os.path.exists(train_path):
-        raise FileNotFoundError(
-            f"Processed features not found at '{train_path}'. "
-            "Please run data_prep_and_split-v3.py first to generate processed features."
-        )
+DATA_PATH = os.path.join(PROJECT_ROOT, "datasets", "processed", "train_features.csv")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+PLOTS_DIR = os.path.join(MODELS_DIR, "plots")
+RANDOM_STATE = 42
+K_RANGE = range(2, 9)
 
-    df = pd.read_csv(train_path)
-    
-    # Filter strictly for Phishing class (label == 1)
-    if 'label' in df.columns:
-        phishing_df = df[df['label'] == 1].drop(columns=['label'])
-    else:
-        phishing_df = df.copy()
-        
-    print(f"Loaded {len(phishing_df)} phishing instances for unsupervised clustering.")
-    return phishing_df
+# Binary flags and entropy are already on a small scale; everything else is a
+# count or a length with a long tail.
+SKEWED = [c for c in FEATURE_COLUMNS if c.startswith(("count_", "url_len", "domain_len",
+                                                      "path_len", "domain_count"))]
 
-def run_phishing_clustering(phishing_df, n_clusters=3, output_dir=None):
-    """
-    Applies StandardScaler and KMeans clustering on phishing URLs.
-    Generates PCA visual plots and cluster feature comparison table.
-    """
-    if output_dir is None:
-        project_root = get_project_root()
-        output_dir = os.path.join(project_root, 'models')
 
-    plots_dir = os.path.join(output_dir, 'plots')
-    os.makedirs(plots_dir, exist_ok=True)
+def load_malicious(path=DATA_PATH):
+    """Malicious training URLs only. Returns (features, url+type for reporting)."""
+    df = pd.read_csv(path)
+    mal = df[df["label"] == 1].reset_index(drop=True)
+    print(f"Clustering {len(mal):,} malicious URLs (labels not used)")
+    return mal[FEATURE_COLUMNS], mal[["url", "type"]]
 
-    print(f"\n--- Starting K-Means Unsupervised Clustering (k={n_clusters}) ---")
 
-    # 1. Feature Scaling
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(phishing_df)
+def prepare(X):
+    """log1p on skewed columns, then standardise every column."""
+    Xt = X.astype(float).copy()
+    Xt[SKEWED] = np.log1p(Xt[SKEWED])
+    return StandardScaler().fit_transform(Xt)
 
-    # 2. KMeans Fitting
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(X_scaled)
 
-    # Evaluate Silhouette Score if sample size permits
-    if len(phishing_df) > n_clusters:
-        sil_score = silhouette_score(X_scaled, cluster_labels)
-        print(f"Silhouette Score (k={n_clusters}): {sil_score:.4f}")
-
-    # 3. Cluster Profile & Mean Feature Analysis
-    df_analyzed = phishing_df.copy()
-    df_analyzed['cluster'] = cluster_labels
-
-    cluster_means = df_analyzed.groupby('cluster').mean().round(3)
-
-    print("\nCluster Feature Averages:")
-    print(cluster_means)
-
-    # Save summary table
-    summary_path = os.path.join(output_dir, 'cluster_summary.csv')
-    cluster_means.to_csv(summary_path)
-    print(f"\nSaved cluster profile summary table to: {summary_path}")
-
-    # 4. PCA Visualization (2D Projection)
-    pca = PCA(n_components=2, random_state=42)
-    pca_coords = pca.fit_transform(X_scaled)
-
-    plt.figure(figsize=(7, 5))
-    scatter = plt.scatter(pca_coords[:, 0], pca_coords[:, 1], c=cluster_labels, cmap='viridis', alpha=0.8, edgecolors='k')
-    plt.colorbar(scatter, label='Cluster ID')
-    plt.title('Unsupervised K-Means Clustering on Phishing URLs (2D PCA)')
-    plt.xlabel(f'PCA Component 1 ({pca.explained_variance_ratio_[0]*100:.1f}% var)')
-    plt.ylabel(f'PCA Component 2 ({pca.explained_variance_ratio_[1]*100:.1f}% var)')
-    plt.grid(True, linestyle='--', alpha=0.5)
+def choose_k(Xs):
+    """Silhouette score for each k on a fixed sample; returns best k and scores."""
+    rng = np.random.default_rng(RANDOM_STATE)
+    sample = Xs[rng.choice(len(Xs), size=min(10000, len(Xs)), replace=False)]
+    scores = {}
+    for k in K_RANGE:
+        labels = KMeans(n_clusters=k, n_init=10, random_state=RANDOM_STATE).fit_predict(sample)
+        scores[k] = silhouette_score(sample, labels)
+        print(f"  k={k}: silhouette {scores[k]:.4f}")
+    plt.figure(figsize=(6, 4))
+    plt.plot(list(scores), list(scores.values()), marker="o")
+    plt.title("Silhouette score by number of clusters")
+    plt.xlabel("k")
+    plt.ylabel("Silhouette score (10,000-URL sample)")
+    plt.grid(alpha=0.4)
     plt.tight_layout()
-
-    plot_path = os.path.join(plots_dir, 'kmeans_clusters.png')
-    plt.savefig(plot_path, dpi=150)
+    plt.savefig(os.path.join(PLOTS_DIR, "silhouette_k.png"), dpi=150)
     plt.close()
-    print(f"Saved cluster scatter plot to: {plot_path}\n")
+    # Silhouette keeps creeping up as k grows, with smaller and smaller gains.
+    # Take the smallest k within 5% of the best score: almost the same cluster
+    # quality, but few enough clusters to describe and act on.
+    top = max(scores.values())
+    best = min(k for k, s in scores.items() if s >= 0.95 * top)
+    print(f"Chosen k = {best} (smallest k within 5% of the best score {top:.4f})")
+    return best, scores
 
-    return cluster_means
+
+def profile(X, info, labels, Xs, centres):
+    """Describe each cluster against the overall malicious average."""
+    overall_mean, overall_std = X.mean(), X.std().replace(0, 1)
+    rows, examples = [], []
+    for c in sorted(set(labels)):
+        mask = labels == c
+        z = ((X[mask].mean() - overall_mean) / overall_std).round(2)
+        top = z.abs().sort_values(ascending=False).index[:3]
+        comp = info.loc[mask, "type"].value_counts(normalize=True).round(3)
+        row = {"cluster": c, "size": int(mask.sum()),
+               "top_features": "; ".join(f"{f} {z[f]:+.2f}" for f in top),
+               "composition": "; ".join(f"{t} {p:.1%}" for t, p in comp.items())}
+        row.update({f"z_{f}": z[f] for f in FEATURE_COLUMNS})
+        row.update({f"mean_{f}": round(X[mask][f].mean(), 3) for f in FEATURE_COLUMNS})
+        rows.append(row)
+        # Example URLs: the 5 members closest to the cluster centre
+        idx = np.where(mask)[0]
+        dist = np.linalg.norm(Xs[idx] - centres[c], axis=1)
+        for i in idx[np.argsort(dist)[:5]]:
+            examples.append({"cluster": c, "url": info.at[i, "url"], "type": info.at[i, "type"]})
+    return pd.DataFrame(rows), pd.DataFrame(examples)
+
+
+def plot_pca(Xs, labels):
+    """2-D PCA scatter of a sample, coloured by cluster."""
+    rng = np.random.default_rng(RANDOM_STATE)
+    idx = rng.choice(len(Xs), size=min(20000, len(Xs)), replace=False)
+    pca = PCA(n_components=2, random_state=RANDOM_STATE).fit(Xs)
+    pts = pca.transform(Xs[idx])
+    plt.figure(figsize=(7, 5))
+    colours = plt.get_cmap("tab10")
+    for c in sorted(set(labels)):
+        sel = labels[idx] == c
+        plt.scatter(pts[sel, 0], pts[sel, 1], s=4, alpha=0.6, color=colours(c),
+                    label=f"Cluster {c}")
+    plt.legend(markerscale=4, frameon=False)
+    plt.title("k-means clusters of malicious URLs (PCA, 20,000-URL sample)")
+    plt.xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.1%} of variance)")
+    plt.ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.1%} of variance)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "kmeans_clusters.png"), dpi=150)
+    plt.close()
+
+
+def main():
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    X, info = load_malicious()
+    Xs = prepare(X)
+    k, _ = choose_k(Xs)
+    km = KMeans(n_clusters=k, n_init=10, random_state=RANDOM_STATE).fit(Xs)
+    summary, examples = profile(X, info, km.labels_, Xs, km.cluster_centers_)
+    summary.to_csv(os.path.join(MODELS_DIR, "cluster_summary.csv"), index=False)
+    examples.to_csv(os.path.join(MODELS_DIR, "cluster_examples.csv"), index=False)
+    plot_pca(Xs, km.labels_)
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_colwidth", 120)
+    print(summary[["cluster", "size", "top_features", "composition"]].to_string(index=False))
+    print(examples.to_string(index=False))
+
 
 if __name__ == "__main__":
-    project_root = get_project_root()
-    data_dir = os.path.join(project_root, 'datasets', 'processed')
-    output_dir = os.path.join(project_root, 'models')
-
-    try:
-        phishing_df = load_phishing_features(data_dir)
-        run_phishing_clustering(phishing_df, n_clusters=3, output_dir=output_dir)
-    except FileNotFoundError as e:
-        print(f"\n[Error] {e}")
-        print("Creating mock phishing feature dataset for test demonstration...")
-        
-        mock_phishing = pd.DataFrame({
-            'url_len': [35, 61, 28, 40, 55, 30],
-            'domain_len': [26, 47, 11, 11, 20, 15],
-            'path_len': [9, 14, 17, 29, 35, 15],
-            'count_dots': [2, 5, 2, 3, 4, 2],
-            'count_hyphens': [2, 4, 0, 1, 3, 1],
-            'count_slashes': [2, 2, 3, 3, 4, 2],
-            'count_questions': [0, 0, 0, 1, 0, 0],
-            'count_equal': [0, 0, 0, 1, 2, 0],
-            'count_at': [0, 1, 0, 0, 0, 0],
-            'count_digits': [0, 0, 4, 3, 1, 0],
-            'domain_count_dots': [2, 4, 3, 1, 2, 1],
-            'has_http': [1, 1, 1, 1, 1, 1],
-            'has_https': [0, 0, 0, 0, 0, 0],
-            'is_ip_address': [0, 0, 1, 0, 0, 0],
-            'domain_has_prefix_suffix_hyphen': [0, 0, 0, 0, 0, 0],
-            'is_shortened': [0, 0, 0, 0, 0, 0],
-            'count_suspicious_keywords': [1, 5, 2, 2, 3, 1],
-            'domain_entropy': [3.84, 4.11, 2.30, 3.10, 3.90, 3.20]
-        })
-        
-        os.makedirs(data_dir, exist_ok=True)
-        mock_phishing['label'] = 1
-        mock_phishing.to_csv(os.path.join(data_dir, 'train_features.csv'), index=False)
-        
-        print("Mock file created. Retrying clustering pipeline...\n")
-        phishing_df = load_phishing_features(data_dir)
-        run_phishing_clustering(phishing_df, n_clusters=3, output_dir=output_dir)
+    main()

@@ -1,154 +1,148 @@
+"""
+train_classifier.py
+-------------------
+Trains and compares every classifier on the same train/test split.
+
+Outputs (in models/):
+    model_comparison.csv          accuracy, precision, recall, F1, FPR, time, size
+    phishing_pipeline.joblib      the best model by F1, used by predict.py
+    test_predictions.csv          the best model's prediction for every test URL
+                                  (used for error analysis)
+    plots/cm_<model>.png          one confusion matrix per model
+    plots/feature_importance.png  random forest feature importance
+
+Usage (from the project root):
+    python src/train_classifier.py
+"""
+
 import os
 import sys
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import seaborn as sns
+import time
+
 import joblib
+import matplotlib
+matplotlib.use("Agg")  # save plots to file without opening a window
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+                             precision_score, recall_score)
 
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score
-)
-
-# Dynamic project root calculation
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR) if os.path.basename(SCRIPT_DIR) == 'src' else SCRIPT_DIR
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-def load_split_data(data_dir):
-    """
-    Loads train and test feature matrices from CSV files inside datasets/processed/.
-    """
-    train_path = os.path.join(data_dir, 'train_features.csv')
-    test_path = os.path.join(data_dir, 'test_features.csv')
-    
-    if not os.path.exists(train_path) or not os.path.exists(test_path):
-        raise FileNotFoundError(
-            f"Processed features not found in '{data_dir}'. "
-            "Please run data_prep_and_split-v3.py first to generate 'train_features.csv' and 'test_features.csv'."
-        )
-        
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-    
-    X_train = train_df.drop(columns=['label'])
-    y_train = train_df['label']
-    X_test = test_df.drop(columns=['label'])
-    y_test = test_df['label']
-    
-    return X_train, X_test, y_train, y_test
+from feature_extraction import FEATURE_COLUMNS  # noqa: E402
+from model_builders import BEYOND_UNIT_MODELS, build_models  # noqa: E402
 
-def train_and_evaluate_models(X_train, X_test, y_train, y_test, output_dir):
-    """
-    Trains multiple classification models, evaluates metrics, saves plots, and exports the top pipeline.
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    plots_dir = os.path.join(output_dir, 'plots')
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    models = {
-        'LogisticRegression': Pipeline([
-            ('scaler', StandardScaler()),
-            ('model', LogisticRegression(random_state=42))
-        ]),
-        'DecisionTree': Pipeline([
-            ('model', DecisionTreeClassifier(random_state=42, max_depth=5))
-        ]),
-        'RandomForest': Pipeline([
-            ('model', RandomForestClassifier(n_estimators=100, random_state=42))
-        ])
+DATA_DIR = os.path.join(PROJECT_ROOT, "datasets", "processed")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "models")
+PLOTS_DIR = os.path.join(MODELS_DIR, "plots")
+INPUT_COLUMNS = ["url"] + FEATURE_COLUMNS  # what every pipeline receives
+
+
+def load_split(data_dir=DATA_DIR):
+    """Load the processed train and test CSVs."""
+    train = pd.read_csv(os.path.join(data_dir, "train_features.csv"))
+    test = pd.read_csv(os.path.join(data_dir, "test_features.csv"))
+    print(f"Train: {len(train):,} rows   Test: {len(test):,} rows")
+    return train, test
+
+
+def evaluate(y_true, y_pred):
+    """Standard metrics for the malicious class, plus the false-positive rate."""
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    return {
+        "Accuracy": accuracy_score(y_true, y_pred),
+        "Precision": precision_score(y_true, y_pred, zero_division=0),
+        "Recall": recall_score(y_true, y_pred, zero_division=0),
+        "F1": f1_score(y_true, y_pred, zero_division=0),
+        # FPR = share of ALL benign URLs wrongly flagged (not 1 - precision)
+        "FPR": fp / (fp + tn),
+        "TN": tn, "FP": fp, "FN": fn, "TP": tp,
     }
-    
-    results = []
-    best_f1 = -1.0
-    best_model_name = ""
-    best_pipeline = None
-    
-    print("--- Starting Supervised Classification Training ---\n")
-    
-    for name, pipeline in models.items():
-        try:
-            pipeline.fit(X_train, y_train)
-            y_pred = pipeline.predict(X_test)
-            
-            acc = accuracy_score(y_test, y_pred)
-            prec = precision_score(y_test, y_pred, zero_division=0)
-            rec = recall_score(y_test, y_pred, zero_division=0)
-            f1 = f1_score(y_test, y_pred, zero_division=0)
-            
-            results.append({
-                'Model': name,
-                'Accuracy': round(acc, 4),
-                'Precision': round(prec, 4),
-                'Recall': round(rec, 4),
-                'F1 Score': round(f1, 4)
-            })
-            
-            print(f"=== {name} ===")
-            print(f"Accuracy:  {acc:.4f}")
-            print(f"Precision: {prec:.4f}")
-            print(f"Recall:    {rec:.4f}")
-            print(f"F1 Score:  {f1:.4f}")
-            print("\nClassification Report:")
-            print(classification_report(y_test, y_pred, zero_division=0))
-            
-            # Save Confusion Matrix Plot
-            cm = confusion_matrix(y_test, y_pred)
-            plt.figure(figsize=(5, 4))
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                        xticklabels=['Legitimate', 'Phishing'],
-                        yticklabels=['Legitimate', 'Phishing'])
-            plt.title(f'Confusion Matrix: {name}')
-            plt.xlabel('Predicted Label')
-            plt.ylabel('True Label')
-            plt.tight_layout()
-            
-            plot_path = os.path.join(plots_dir, f'cm_{name.lower()}.png')
-            plt.savefig(plot_path, dpi=150)
-            plt.close()
-            print(f"Saved Confusion Matrix image to: {plot_path}\n")
-            
-            if f1 >= best_f1:
-                best_f1 = f1
-                best_model_name = name
-                best_pipeline = pipeline
-                
-        except Exception as e:
-            print(f"Could not evaluate {name}: {e}\n")
-            
-    if best_pipeline is not None:
-        model_save_path = os.path.join(output_dir, 'phishing_pipeline.joblib')
-        joblib.dump(best_pipeline, model_save_path)
-        print(f"--> Saved best performing model ({best_model_name} with F1={best_f1:.4f}) to: {model_save_path}")
-        
-    results_df = pd.DataFrame(results)
-    results_path = os.path.join(output_dir, 'model_comparison.csv')
-    results_df.to_csv(results_path, index=False)
-    print(f"Saved model comparison table to: {results_path}\n")
-    
-    return results_df
+
+
+def plot_confusion(cm, name):
+    """Save a labelled confusion-matrix heatmap."""
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt=",d", cmap="Blues",
+                xticklabels=["Legitimate", "Malicious"],
+                yticklabels=["Legitimate", "Malicious"])
+    plt.title(f"Confusion matrix: {name}")
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, f"cm_{name.lower()}.png"), dpi=150)
+    plt.close()
+
+
+def plot_feature_importance(pipeline):
+    """Bar chart of random forest feature importance (mean decrease in impurity)."""
+    imp = pd.Series(pipeline.named_steps["model"].feature_importances_,
+                    index=FEATURE_COLUMNS).sort_values()
+    plt.figure(figsize=(7, 6))
+    imp.plot.barh(color="#4C72B0")
+    plt.title("Random forest feature importance")
+    plt.xlabel("Mean decrease in impurity")
+    plt.tight_layout()
+    plt.savefig(os.path.join(PLOTS_DIR, "feature_importance.png"), dpi=150)
+    plt.close()
+    return imp.sort_values(ascending=False)
+
+
+def main():
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    train, test = load_split()
+    X_train, y_train = train[INPUT_COLUMNS], train["label"]
+    X_test, y_test = test[INPUT_COLUMNS], test["label"]
+
+    rows, fitted = [], {}
+    for name, pipeline in build_models().items():
+        print(f"\n=== {name} ===")
+        start = time.time()
+        pipeline.fit(X_train, y_train)
+        train_secs = time.time() - start
+        y_pred = pipeline.predict(X_test)
+
+        # Size of the saved model file, in MB
+        tmp = os.path.join(MODELS_DIR, f"_{name}.joblib")
+        joblib.dump(pipeline, tmp, compress=3)
+        size_mb = os.path.getsize(tmp) / 1e6
+        os.remove(tmp)
+
+        m = evaluate(y_test, y_pred)
+        m.update({"Model": name, "Beyond unit": name in BEYOND_UNIT_MODELS,
+                  "Train seconds": round(train_secs, 1), "Size MB": round(size_mb, 1)})
+        rows.append(m)
+        fitted[name] = pipeline
+        plot_confusion(confusion_matrix(y_test, y_pred), name)
+        print(f"Accuracy {m['Accuracy']:.4f}  Precision {m['Precision']:.4f}  "
+              f"Recall {m['Recall']:.4f}  F1 {m['F1']:.4f}  FPR {m['FPR']:.4f}  "
+              f"({train_secs:.0f}s, {size_mb:.1f} MB)")
+
+    results = pd.DataFrame(rows)[["Model", "Beyond unit", "Accuracy", "Precision", "Recall",
+                                  "F1", "FPR", "TN", "FP", "FN", "TP",
+                                  "Train seconds", "Size MB"]]
+    results.round(4).to_csv(os.path.join(MODELS_DIR, "model_comparison.csv"), index=False)
+    print("\n" + results.round(4).to_string(index=False))
+
+    # Deploy the best model by F1 on the malicious class
+    best = results.loc[results["F1"].idxmax(), "Model"]
+    best_pipe = fitted[best]
+    joblib.dump(best_pipe, os.path.join(MODELS_DIR, "phishing_pipeline.joblib"), compress=3)
+    print(f"\nSaved best model ({best}) to models/phishing_pipeline.joblib")
+
+    # Save every test prediction of the best model for error analysis
+    preds = test[["url", "type", "label"]].copy()
+    preds["predicted"] = best_pipe.predict(X_test)
+    preds["malicious_probability"] = best_pipe.predict_proba(X_test)[:, 1].round(4)
+    preds.to_csv(os.path.join(MODELS_DIR, "test_predictions.csv"), index=False)
+
+    imp = plot_feature_importance(fitted["RandomForest"])
+    print("\nRandom forest feature importance (top 8):")
+    print(imp.head(8).round(4).to_string())
+
 
 if __name__ == "__main__":
-    default_data_dir = os.path.join(PROJECT_ROOT, 'datasets', 'processed')
-    default_models_dir = os.path.join(PROJECT_ROOT, 'models')
-
-    data_dir = sys.argv[1] if len(sys.argv) > 1 else default_data_dir
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else default_models_dir
-    
-    print(f"Loading split feature datasets from: {data_dir}")
-    try:
-        X_train, X_test, y_train, y_test = load_split_data(data_dir)
-        train_and_evaluate_models(X_train, X_test, y_train, y_test, output_dir)
-    except FileNotFoundError as e:
-        print(f"\n[Error] {e}")
+    main()

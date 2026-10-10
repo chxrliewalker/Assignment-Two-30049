@@ -1,117 +1,224 @@
+"""
+feature_extraction.py
+---------------------
+Turns raw URL strings into a numeric feature table.
+
+The same functions are used for the training data (data_prep_and_split.py)
+and for a single URL typed by a user (predict.py), so the model always sees
+features computed in exactly the same way.
+
+Pipeline for every URL:
+    raw string -> canonicalise() -> split into host / path / query -> features
+"""
+
 import math
+import re
 from collections import Counter
 from urllib.parse import urlparse, ParseResult
-import numpy as np
+
 import pandas as pd
 
-def safe_url_parse(url):
-    """
-    Safely parses URLs, handling malformed IPv6 brackets or noisy characters
-    commonly found in raw cybersecurity datasets.
-    """
-    url_str = str(url).strip()
-    
-    # Ensure netloc parsing works for schemeless URLs
-    if '://' not in url_str:
-        url_str = '//' + url_str
+# ---------------------------------------------------------------------------
+# Reference lists used by the threat-specific features
+# ---------------------------------------------------------------------------
 
+# Known URL-shortening services. Matched against the *registered domain*
+# (e.g. "bit.ly"), never as a substring, so "microsoft.com" is not mistaken
+# for "t.co".
+SHORTENERS = {
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "ow.ly", "is.gd", "buff.ly",
+    "adf.ly", "bitly.com", "cutt.ly", "rb.gy", "shorturl.at", "tiny.cc",
+    "x.co", "s.id", "v.gd", "rebrand.ly", "bl.ink", "lnkd.in", "db.tt",
+}
+
+# Top-level domains with a high rate of abuse relative to their size.
+# First five: highest-ranked in Interisle's Phishing Landscape 2025
+# (Piscitello and Rose 2025). The rest are the formerly free Freenom TLDs and
+# other cheap TLDs widely reported as abused when the dataset was collected.
+RISKY_TLDS = {
+    "xin", "bond", "help", "win", "cfd",
+    "tk", "ml", "ga", "cf", "gq",
+    "top", "xyz", "icu", "cyou", "sbs", "click", "buzz", "rest", "zip", "mov",
+}
+
+# Brands that phishing pages commonly impersonate. Used to detect a brand name
+# that appears in a URL without being the site's own registered domain.
+BRANDS = {
+    "paypal", "apple", "icloud", "microsoft", "office365", "outlook",
+    "google", "gmail", "amazon", "facebook", "instagram", "whatsapp",
+    "netflix", "ebay", "linkedin", "dropbox", "adobe", "chase",
+    "wellsfargo", "bankofamerica", "citibank", "hsbc", "dhl", "fedex",
+    "usps", "auspost", "commbank", "westpac", "steam", "coinbase",
+}
+
+# Words that create urgency or ask for credentials (social engineering).
+SUSPICIOUS_KEYWORDS = r"login|verify|update|account|banking|secure|signin|confirm|password|webscr|ebayisapi"
+
+# Two-label public suffixes, so "example.com.au" gives registered domain
+# "example.com.au" rather than "com.au". A short list is enough for the
+# features below; it is not a full public-suffix list.
+TWO_LEVEL_SUFFIXES = {
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+    "edu.au", "gov.au", "co.nz", "co.jp", "co.in", "com.br", "com.cn",
+    "co.za", "com.mx", "com.tr", "com.sg", "com.my", "co.id",
+}
+
+SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+WWW_RE = re.compile(r"^www\d?\.", re.IGNORECASE)
+IPV4_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}$")
+
+
+# ---------------------------------------------------------------------------
+# Step 1: canonicalise and parse
+# ---------------------------------------------------------------------------
+
+def canonicalise(url):
+    """
+    Bring every URL to one consistent format before any feature is computed.
+
+    - removes the scheme (http://, https://, ftp://) because in this dataset
+      its presence depends on which source list a URL came from, not on
+      whether the URL is malicious (see the report, Section 5.2)
+    - removes a leading "www." for the same reason
+    - lower-cases the host (DNS is case-insensitive); the path keeps its case
+    """
+    s = str(url).strip()
+    s = SCHEME_RE.sub("", s)
+    s = WWW_RE.sub("", s)
+    # Lower-case only the host part (everything before the first / ? or #)
+    m = re.match(r"^([^/?#]*)(.*)$", s, re.DOTALL)
+    host, rest = m.group(1), m.group(2)
+    return host.lower() + rest
+
+
+def safe_url_parse(canonical_url):
+    """
+    Parse a canonical (scheme-less) URL without crashing on malformed input.
+
+    urlparse() raises ValueError on unbalanced square brackets, which occur in
+    a few raw rows. Those brackets are percent-encoded and parsing is retried;
+    a string that still fails is treated as a bare path.
+    """
+    s = "//" + canonical_url  # "//" makes urlparse treat the first part as the host
     try:
-        return urlparse(url_str)
+        return urlparse(s)
     except ValueError:
-        # Sanitize malformed square brackets (convert [ and ] to percent-encoding)
-        sanitized = url_str.replace('[', '%5B').replace(']', '%5D')
         try:
-            return urlparse(sanitized)
-        except Exception:
-            # Return empty fallback ParseResult if string is completely unparseable
-            return ParseResult(scheme='', netloc='', path=url_str, params='', query='', fragment='')
+            return urlparse(s.replace("[", "%5B").replace("]", "%5D"))
+        except ValueError:
+            return ParseResult("", "", canonical_url, "", "", "")
 
-def calculate_entropy(text):
-    """Calculates the Shannon entropy of a string (higher means more random)."""
+
+def split_host(host):
+    """
+    Split a host name into (subdomain, registered_domain, tld).
+
+    "login.paypal.com.evil.xyz" -> ("login.paypal.com", "evil.xyz", "xyz")
+    "shop.example.com.au"       -> ("shop", "example.com.au", "au")
+    An IP address is returned as its own registered domain with no TLD.
+    """
+    host = host.split("@")[-1]          # drop any "user@" part
+    host = host.split(":")[0].strip(".")  # drop any ":port"
+    if not host or IPV4_RE.match(host):
+        return "", host, ""
+    labels = host.split(".")
+    if len(labels) == 1:
+        return "", host, ""
+    n = 3 if ".".join(labels[-2:]) in TWO_LEVEL_SUFFIXES and len(labels) >= 3 else 2
+    return ".".join(labels[:-n]), ".".join(labels[-n:]), labels[-1]
+
+
+def shannon_entropy(text):
+    """Shannon entropy in bits per character: high for random strings."""
     if not text:
         return 0.0
-    counts = Counter(text)
-    frequencies = [float(c) / len(text) for c in counts.values()]
-    return -sum(f * math.log2(f) for f in frequencies)
+    n = len(text)
+    return -sum((c / n) * math.log2(c / n) for c in Counter(text).values())
 
-def extract_url_features(df, url_column):
+
+# ---------------------------------------------------------------------------
+# Step 2: features for one URL
+# ---------------------------------------------------------------------------
+
+FEATURE_COLUMNS = [
+    "url_len", "domain_len", "path_len",
+    "count_dots", "count_hyphens", "count_slashes", "count_questions",
+    "count_equal", "count_at", "count_digits", "domain_count_dots",
+    "is_ip_address", "domain_has_prefix_suffix_hyphen", "is_shortened",
+    "count_suspicious_keywords", "domain_entropy",
+    "risky_tld", "has_punycode_or_non_ascii", "brand_outside_domain",
+]
+
+
+def url_features(raw_url):
+    """Return a dict of every feature in FEATURE_COLUMNS for one raw URL."""
+    canon = canonicalise(raw_url)
+    parsed = safe_url_parse(canon)
+    host = parsed.netloc.split("@")[-1].split(":")[0]
+    subdomain, registered, tld = split_host(parsed.netloc)
+    lower = canon.lower()
+
+    # Brand impersonation: a known brand appears in the subdomain or the path,
+    # but the site's registered name (e.g. "evil" in "evil.xyz") is not that
+    # brand. "paypal.com.evil.xyz/login" -> 1; "paypal.com/login" -> 0.
+    registered_name = registered.split(".")[0] if registered else ""
+    outside_text = (subdomain + "/" + parsed.path + "?" + parsed.query).lower()
+    brand_outside = int(any(b in outside_text and b != registered_name for b in BRANDS))
+
+    return {
+        # Lengths: long URLs push the real domain out of view
+        "url_len": len(canon),
+        "domain_len": len(host),
+        "path_len": len(parsed.path),
+        # Character counts
+        "count_dots": canon.count("."),
+        "count_hyphens": canon.count("-"),
+        "count_slashes": canon.count("/"),
+        "count_questions": canon.count("?"),
+        "count_equal": canon.count("="),
+        "count_at": canon.count("@"),       # browser ignores text before @
+        "count_digits": sum(ch.isdigit() for ch in canon),
+        "domain_count_dots": host.count("."),  # subdomain depth
+        # Structural threat flags
+        "is_ip_address": int(bool(IPV4_RE.match(host))),
+        "domain_has_prefix_suffix_hyphen": int(host.startswith("-") or host.endswith("-")),
+        "is_shortened": int(registered in SHORTENERS),
+        "count_suspicious_keywords": len(re.findall(SUSPICIOUS_KEYWORDS, lower)),
+        "domain_entropy": round(shannon_entropy(host), 4),
+        # Researched features
+        "risky_tld": int(tld in RISKY_TLDS),
+        "has_punycode_or_non_ascii": int("xn--" in host or any(ord(ch) > 127 for ch in host)),
+        "brand_outside_domain": brand_outside,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 3: features for a whole DataFrame
+# ---------------------------------------------------------------------------
+
+def extract_url_features(df, url_column="url"):
     """
-    Transforms a DataFrame column of raw URLs into numerical feature columns.
+    Add every feature column to a copy of df and return it.
+
+    The original columns (e.g. url, label, type) are kept so they can be saved
+    alongside the features; the training scripts select FEATURE_COLUMNS only.
     """
-    urls = df[url_column].astype(str)
+    feats = pd.DataFrame([url_features(u) for u in df[url_column].astype(str)],
+                         index=df.index, columns=FEATURE_COLUMNS)
+    return pd.concat([df.copy(), feats], axis=1)
 
-    # 1. Safe Parse
-    parsed_urls = urls.apply(safe_url_parse)
 
-    domains = parsed_urls.apply(lambda x: x.netloc)
-    paths = parsed_urls.apply(lambda x: x.path)
-
-    # 2. Lexical Length Features
-    df['url_len'] = urls.str.len()
-    df['domain_len'] = domains.str.len()
-    df['path_len'] = paths.str.len()
-
-    # 3. Special Character Counts
-    df['count_dots'] = urls.str.count(r'\.')
-    df['count_hyphens'] = urls.str.count('-')
-    df['count_slashes'] = urls.str.count('/')
-    df['count_questions'] = urls.str.count(r'\?')
-    df['count_equal'] = urls.str.count('=')
-    df['count_at'] = urls.str.count('@')
-    df['count_digits'] = urls.str.count(r'\d')
-
-    # Subdomain depth
-    df['domain_count_dots'] = domains.str.count(r'\.')
-
-    # 4. Structural & Security Threat Flags
-    df['has_http'] = urls.str.lower().str.startswith('http://').astype(int)
-    df['has_https'] = urls.str.lower().str.startswith('https://').astype(int)
-
-    # Check for raw IPv4 address in domain
-    ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
-    df['is_ip_address'] = domains.str.match(ip_pattern).fillna(0).astype(int)
-
-    # Domain prefix/suffix hyphen check
-    df['domain_has_prefix_suffix_hyphen'] = domains.apply(
-        lambda x: 1 if x.startswith('-') or x.endswith('-') else 0
-    )
-
-    # Known URL shortener flag
-    shorteners = r'bit\.ly|tinyurl\.com|goo\.gl|t\.co|ow\.ly|is\.gd|buff\.ly'
-    df['is_shortened'] = domains.str.lower().str.contains(shorteners).astype(int)
-
-    # Suspicious security keywords
-    keywords = r'login|verify|update|account|banking|secure|paypal|signin|confirm'
-    df['count_suspicious_keywords'] = urls.str.lower().str.count(keywords)
-
-    # 5. Shannon Entropy
-    df['domain_entropy'] = domains.apply(calculate_entropy)
-
-    return df
-
-if __name__ == '__main__':
-    import sys
-    
-    input_file = sys.argv[1] if len(sys.argv) > 1 else 'datasets/raw_urls.csv'
-    output_file = sys.argv[2] if len(sys.argv) > 2 else 'datasets/processed_features.csv'
-
-    print(f"Reading raw data from {input_file}...")
-    try:
-        raw_data = pd.read_csv(input_file)
-        print("Extracting features...")
-        processed_data = extract_url_features(raw_data, url_column='url')
-        processed_data.to_csv(output_file, index=False)
-        print(f"Successfully saved extracted feature matrix to {output_file}")
-    except FileNotFoundError:
-        print(f"File '{input_file}' not found. Executing sample feature extraction test...")
-        sample_df = pd.DataFrame({
-            'url': [
-                'https://google.com',
-                'http://[malicious-domain].com/login',
-                '192.168.1.1/login/verify.php',
-                'https://bit.ly/3xYz89'
-            ]
-        })
-        res = extract_url_features(sample_df, url_column='url')
-        print("\nExtracted Features Preview:")
-        print(res[['url', 'url_len', 'is_ip_address', 'is_shortened', 'domain_entropy']])
+if __name__ == "__main__":
+    # Quick demonstration on a few hand-written URLs
+    demo = pd.DataFrame({"url": [
+        "https://www.google.com",
+        "google.com",
+        "http://paypal.com.secure-login.xyz/verify?id=123",
+        "192.168.1.1/admin/login.php",
+        "bit.ly/3xYz89",
+        "http://xn--pple-43d.com/signin",
+    ]})
+    pd.set_option("display.width", 200)
+    print(extract_url_features(demo)[["url", "url_len", "is_ip_address", "is_shortened",
+                                      "risky_tld", "has_punycode_or_non_ascii",
+                                      "brand_outside_domain"]])

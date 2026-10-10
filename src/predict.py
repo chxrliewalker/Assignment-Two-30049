@@ -12,65 +12,7 @@ for d in [os.getcwd(), script_dir, parent_dir, os.path.join(parent_dir, 'src')]:
     if os.path.exists(d) and d not in sys.path:
         sys.path.insert(0, d)
 
-# Import feature extractor safely
-try:
-    from feature_extraction import extract_url_features
-except ImportError:
-    try:
-        from src.feature_extraction import extract_url_features
-    except ImportError:
-        # Fallback inline implementation if imported independently
-        import math
-        from collections import Counter
-        from urllib.parse import urlparse, ParseResult
-
-        def safe_url_parse(url):
-            url_str = str(url).strip()
-            if '://' not in url_str:
-                url_str = '//' + url_str
-            try:
-                return urlparse(url_str)
-            except ValueError:
-                sanitized = url_str.replace('[', '%5B').replace(']', '%5D')
-                try:
-                    return urlparse(sanitized)
-                except Exception:
-                    return ParseResult(scheme='', netloc='', path=url_str, params='', query='', fragment='')
-
-        def calculate_entropy(text):
-            if not text:
-                return 0.0
-            counts = Counter(text)
-            frequencies = [float(c) / len(text) for c in counts.values()]
-            return -sum(f * math.log2(f) for f in frequencies)
-
-        def extract_url_features(df, url_column):
-            urls = df[url_column].astype(str)
-            parsed_urls = urls.apply(safe_url_parse)
-            domains = parsed_urls.apply(lambda x: x.netloc)
-            paths = parsed_urls.apply(lambda x: x.path)
-            df['url_len'] = urls.str.len()
-            df['domain_len'] = domains.str.len()
-            df['path_len'] = paths.str.len()
-            df['count_dots'] = urls.str.count(r'\.')
-            df['count_hyphens'] = urls.str.count('-')
-            df['count_slashes'] = urls.str.count('/')
-            df['count_questions'] = urls.str.count(r'\?')
-            df['count_equal'] = urls.str.count('=')
-            df['count_at'] = urls.str.count('@')
-            df['count_digits'] = urls.str.count(r'\d')
-            df['domain_count_dots'] = domains.str.count(r'\.')
-            df['has_http'] = urls.str.lower().str.startswith('http://').astype(int)
-            df['has_https'] = urls.str.lower().str.startswith('https://').astype(int)
-            ip_pattern = r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'
-            df['is_ip_address'] = domains.str.match(ip_pattern).fillna(0).astype(int)
-            df['domain_has_prefix_suffix_hyphen'] = domains.apply(lambda x: 1 if x.startswith('-') or x.endswith('-') else 0)
-            shorteners = r'bit\.ly|tinyurl\.com|goo\.gl|t\.co|ow\.ly|is\.gd|buff\.ly'
-            df['is_shortened'] = domains.str.lower().str.contains(shorteners).astype(int)
-            keywords = r'login|verify|update|account|banking|secure|paypal|signin|confirm'
-            df['count_suspicious_keywords'] = urls.str.lower().str.count(keywords)
-            df['domain_entropy'] = domains.apply(calculate_entropy)
-            return df
+from feature_extraction import extract_url_features, FEATURE_COLUMNS
 
 def predict_single_url(url_string, model_path='models/phishing_pipeline.joblib'):
     """
@@ -108,7 +50,7 @@ def predict_single_url(url_string, model_path='models/phishing_pipeline.joblib')
     feature_df = extract_url_features(raw_df, url_column='url')
     
     # Isolate feature columns matching model training
-    X_input = feature_df.drop(columns=['url'])
+    X_input = feature_df[['url'] + FEATURE_COLUMNS]
 
     # 4. Predict probability and binary class
     prediction = int(pipeline.predict(X_input)[0])
@@ -119,7 +61,7 @@ def predict_single_url(url_string, model_path='models/phishing_pipeline.joblib')
     risk_score = float(round(phishing_prob * 100, 2))
 
     # 5. Extract diagnostic risk triggers
-    row = X_input.iloc[0]
+    row = X_input[FEATURE_COLUMNS].iloc[0]
     risk_flags = []
     if row.get('is_ip_address', 0) == 1:
         risk_flags.append("Raw IPv4 Address in Domain")
@@ -133,6 +75,12 @@ def predict_single_url(url_string, model_path='models/phishing_pipeline.joblib')
         risk_flags.append(f"High Domain Randomness / Entropy ({row.get('domain_entropy'):.2f})")
     if row.get('count_at', 0) > 0:
         risk_flags.append("Embedded User Authentication Symbol (@)")
+    if row.get('risky_tld', 0) == 1:
+        risk_flags.append("Frequently Abused Top-Level Domain")
+    if row.get('has_punycode_or_non_ascii', 0) == 1:
+        risk_flags.append("Look-alike (Punycode / Non-ASCII) Characters in Domain")
+    if row.get('brand_outside_domain', 0) == 1:
+        risk_flags.append("Brand Name Used Outside the Real Domain")
 
     verdict = "PHISHING / MALICIOUS" if prediction == 1 else "LEGITIMATE / SAFE"
 
@@ -143,7 +91,7 @@ def predict_single_url(url_string, model_path='models/phishing_pipeline.joblib')
         'risk_score_pct': risk_score,
         'trust_score_pct': trust_score,
         'risk_flags': risk_flags if risk_flags else ["No immediate heuristic threat flags triggered"],
-        'features': X_input.to_dict(orient='records')[0]
+        'features': X_input[FEATURE_COLUMNS].to_dict(orient='records')[0]
     }
 
 if __name__ == "__main__":
